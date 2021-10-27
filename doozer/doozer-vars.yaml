@@ -1,0 +1,7 @@
+---
+src:
+  url: https://github.com/ScunkWorks/java-mvn-example.git
+  repo: ScunkWorks/java-mvn-example
+  repoowner: ScunkWorks
+  reponame: java-mvn-example
+  branch: master

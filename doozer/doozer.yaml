@@ -1,0 +1,418 @@
+# example docker build config file
+---
+# display:
+#   background_image: https://www.smarsh.com//media/smarsh-logo-new.svg
+
+resource_types:
+- name: git
+  type: docker-image
+  source:
+    repository: docker-remote.artifacts.corp.digitalreasoning.com/concourse/git-resource
+    username: ((artifactory.username))
+    password: ((artifactory.token))
+- name: registry-image
+  type: docker-image
+  source:
+    repository: docker-remote.artifacts.corp.digitalreasoning.com/concourse/registry-image-resource
+    username: ((artifactory.username))
+    password: ((artifactory.token))
+- name: github-pull-request
+  type: docker-image
+  source:
+    repository: docker-remote.artifacts.corp.digitalreasoning.com/teliaoss/github-pr-resource
+    username: ((artifactory.username))
+    password: ((artifactory.token))
+- name: github-release
+  type: docker-image
+  source:
+    repository: docker-remote.artifacts.corp.digitalreasoning.com/concourse/github-release-resource
+    username: ((artifactory.username))
+    password: ((artifactory.token))
+- name: artifactory
+  type: docker-image
+  source:
+    repository: docker-snapshots.artifacts.corp.digitalreasoning.com/troykinsella2/concourse-artifactory-resource
+    tag: 0.1.0
+    username: ((artifactory.username))
+    password: ((artifactory.token))
+
+resources:
+- name: main-src
+  type: git
+  icon: github
+  source:
+    uri: ((src.url))
+    username: ((github.token))
+    password: ((github.token))
+    fetch_tags: true
+    branch: master # TODO src.branch
+- name: pr-src
+  type: github-pull-request
+  icon: github
+  # check_every: 30s # in smarsh github gate closed by default to ensure PRs cannot be merged right away
+  source:
+    repository: ((src.repo))
+    access_token: ((github.token))
+- name: release-meta
+  type: github-release
+  icon: github
+  source:
+    owner: ((src.repoowner))
+    repository: ((src.reponame))
+    access_token: ((github.token))
+- name: publish-snapshot
+  type: artifactory
+  source:
+    version_strategy: multi-file
+    url: ((artifactory.hosturl))
+    api_key: ((artifactory.token))
+    repository: maven-mle-sandbox # TODO configure
+    path: mle/mvnlib/snapshot # TODO configure
+    file_pattern: 'kafka-streams-example*' # TODO configure
+    version_pattern: '[0-9]+' # TODO configure
+- name: publish-release
+  type: artifactory
+  source:
+    version_strategy: multi-file
+    url: ((artifactory.hosturl))
+    api_key: ((artifactory.token))
+    repository: maven-mle-sandbox # TODO configure
+    path: mle/mvnlib/release # TODO configure
+    file_pattern: 'kafka-streams-example*' # TODO configure
+    version_pattern: '[0-9]+[.][0-9]+[.][0-9]+' # TODO configure
+
+jobs:
+- name: pr-build
+  plan:
+  - get: src
+    resource: pr-src
+    trigger: true
+    version: every
+    params:
+      fetch_tags: true
+  - in_parallel:
+    - do:
+      - put: pr-src
+        params:
+          context: &prcontext Build and Unit Test
+          path: src
+          status: pending
+      - task: build-prep
+        config: &buildprep
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/buildtools
+              tag: 0.11.0-test-pr-57ea7b7
+              username: ((artifactory.username))
+              password: ((artifactory.token))
+          params:
+            ARTIFACTORY_USERNAME: ((artifactory.snapshots_username))
+            ARTIFACTORY_PASSWORD: ((artifactory.snapshots_token))
+            ARTIFACTORY_HOSTNAME: ((artifactory.hostname))
+            SONARQUBE_URL: ((sonarqube.url))
+            SONARQUBE_TOKEN: ((sonarqube.token))
+            GITHUB_TOKEN: ((github.token))
+          inputs:
+          - name: src
+          outputs:
+          - name: secrets
+          - name: tags
+          run:
+            path: sh
+            user: root
+            args:
+            - -exc
+            - |
+              export PR_GIT_BRANCH=$(cat src/.git/resource/head_name)
+              generatesecrets.sh $PWD/src $PWD/secrets
+              generatetags.sh $PWD/src $PWD/tags
+  - in_parallel: &buildsteps
+    - task: build-java-mvn-lib
+      privileged: true
+      config: &build_config_anchor
+        platform: linux
+        image_resource:
+          type: registry-image
+          source:
+            repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-base-images/centos7-maven-jdk11-build
+            username: ((artifactory.username))
+            password: ((artifactory.token))
+        inputs:
+        - name: secrets
+        - name: tags
+        - name: src
+        outputs:
+        - name: src
+        run:
+          path: sh
+          user: root
+          args:
+          - -ce
+          - |
+            #!/usr/bin/env bash
+
+            set -e
+
+            exec 3>&1 # make stdout available as fd 3 for the result
+            exec 1>&2 # redirect all output to stderr for logging
+
+            printf 'out...'
+            echo $1
+            #  INPUT **************************************************************************************
+            # Read stdin (which is json paramter) to file
+            # -M = Monochrome output
+            # -S = Sort order,
+            # . =  get everything.
+            jq -M -S . < /dev/stdin | tee /tmp/input.json    # tee redirects to a file.
+
+            echo "json stdin is:"
+            cat /tmp/input.json
+            echo ""
+
+            # PARSE THE JSON FILE /tmp/input.json
+            TOOL=$(jq -r .params.tool < /tmp/input.json)
+            ACTION=$(jq -r .params.action < /tmp/input.json)
+            BASENAME=$(jq -r .params.basename < /tmp/input.json)
+
+            echo "TOOL=$TOOL; ACTION=$ACTION; BASENAME=$BASENAME;"
+
+            echo ""
+            ls
+            echo ""
+            # TODO move all secrets into the correct location
+            # cp secrets/opt/app-root/.m2/settings.xml /opt/app-root/.m2/
+            # source secrets/etc/app-root/shell-envs.sh
+
+            # TODO: possibly split by if java, else python...
+            cd src
+            ls -a .
+            source $MAVEN_HOME/bin/mvn_cmds.sh
+            source $CI_TOOLS/package
+            TAG=$(tags_snapshot ${TOOL})
+            # bash -c "set -e && $(${TOOL}_${ACTION}_COMMAND)"
+            bash $CI_TOOLS/package $ACTION $TOOL $BASENAME
+            ls
+
+            printf "{\"version\":{\"ref\": \"${TAG}\"}}" >&3
+
+  - in_parallel: &publishsteps
+      - put: publish-snapshot
+        params:
+          files: src/target
+          glob: "*.jar"
+  on_success:
+    put: pr-src
+    params:
+      context: *prcontext
+      path: pr-src
+      status: success
+  on_failure:
+    put: pr-src
+    params:
+      context: *prcontext
+      path: pr-src
+      status: failure
+
+- name: main-build
+  plan:
+  - get: src
+    resource: main-src
+    trigger: true
+    version: every
+    params:
+      fetch_tags: true
+  - in_parallel:
+      - do:
+      - task: build-prep
+        config: &buildprep
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/buildtools
+              tag: 0.11.0-test-pr-57ea7b7
+              # tag: latest
+              username: ((artifactory.username))
+              password: ((artifactory.token))
+          params:
+            ARTIFACTORY_USERNAME: ((artifactory.snapshots_username))
+            ARTIFACTORY_PASSWORD: ((artifactory.snapshots_token))
+            ARTIFACTORY_HOSTNAME: ((artifactory.hostname))
+            SONARQUBE_URL: ((sonarqube.url))
+            SONARQUBE_TOKEN: ((sonarqube.token))
+            GITHUB_TOKEN: ((github.token))
+          inputs:
+          - name: src
+          outputs:
+          - name: secrets
+          - name: tags
+          run:
+            path: sh
+            user: root
+            args:
+            - -ec
+            - |
+              echo will build and push branch $whatBranch to artifact repo $whatRepo
+              # export PR_GIT_BRANCH=$(cat src/.git/resource/head_name)
+              generatesecrets.sh $PWD/src $PWD/secrets
+              generatetags.sh $PWD/src $PWD/tags
+  - in_parallel: &buildsteps
+    - task: build-java-mvn-lib
+      privileged: true
+      config: &build_config_anchor
+        platform: linux
+        image_resource:
+          type: registry-image
+          source:
+            repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-base-images/centos7-maven-jdk11-build
+            username: ((artifactory.username))
+            password: ((artifactory.token))
+        inputs:
+        - name: secrets
+        - name: tags
+        - name: src
+        outputs:
+        - name: src
+        run:
+          path: sh
+          user: root
+          args:
+          - -ce
+          - |
+            cp secrets/opt/app-root/.m2/settings.xml /opt/app-root/.m2/
+            source secrets/etc/app-root/shell-envs.sh
+            source $MAVEN_HOME/bin/mvn_cmds.sh
+            TAG=$(cat tags/java11_tags)
+            cd src && bash -c "set -e && $(java_build_COMMAND)"
+            ls target
+  - in_parallel: &publishsteps
+      - put: publish-snapshot
+        params:
+          files: src/target
+          glob: "*.jar"
+
+
+- name: release-build
+  plan:
+  - get: meta
+    resource: release-meta
+    trigger: true
+    version: every
+    params:
+      include_source_tarball: true
+  - in_parallel:
+      - do:
+      - task: build-prep
+        config: &buildprep
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/buildtools
+              tag: 0.11.0-test-pr-57ea7b7
+              # tag: latest
+              username: ((artifactory.username))
+              password: ((artifactory.token))
+          params:
+            ARTIFACTORY_USERNAME: ((artifactory.snapshots_username))
+            ARTIFACTORY_PASSWORD: ((artifactory.snapshots_token))
+            ARTIFACTORY_HOSTNAME: ((artifactory.hostname))
+            SONARQUBE_URL: ((sonarqube.url))
+            SONARQUBE_TOKEN: ((sonarqube.token))
+            GITHUB_TOKEN: ((github.token))
+          inputs:
+          - name: meta
+          outputs:
+          - name: secrets
+          - name: tags
+          - name: src
+          run:
+            path: sh
+            user: root
+            args:
+            - -exc
+            - |
+              ls
+              # generatesecrets.sh $PWD/src $PWD/secrets
+              echo will build and push branch $whatBranch to artifact repo $whatRepo
+              export VERSION=$(cat meta/tag)
+              echo "Checking out tag: ${VERSION}"
+              tar -xf meta/source.tar.gz --strip 1 -C $PWD/src && ls src
+              echo $VERSION > tags/release_tag
+  - in_parallel: &buildsteps
+    - task: build-java-mvn-lib
+      privileged: true
+      config: &build_config_anchor
+        platform: linux
+        image_resource:
+          type: registry-image
+          source:
+            repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-base-images/centos7-maven-jdk11-build
+            username: ((artifactory.username))
+            password: ((artifactory.token))
+        # params:
+        #   folder: python
+        inputs:
+        - name: secrets
+        - name: tags
+        - name: src
+        outputs:
+        - name: src
+        run:
+          path: sh
+          user: root
+          args:
+          - -cx
+          - |
+            source $MAVEN_HOME/bin/mvn_cmds.sh
+            TAG=$(cat tags/release_tag)
+            cd src && bash -c "set -e && $(java_build_COMMAND)"
+            ls target
+  - in_parallel: &publishsteps
+      - put: publish-release
+        params:
+          files: src/target
+          glob: "*.jar"
+
+- name: update-pipeline
+  public: true
+  plan:
+  - get: src
+    resource: main-src
+    trigger: true
+  - task: renderpipes
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/doozer
+          username: ((artifactory.username))
+          password: ((artifactory.token))
+      inputs:
+      - name: src
+      outputs:
+      - name: src
+      run:
+        path: sh
+        args:
+          - -cex
+          - |
+            find src/doozer -not -path '*/\.*'
+  - set_pipeline: self
+    file: src/doozer/doozer.yaml
+    var_files:
+    - src/doozer/doozer-vars.yaml
+
+- name: set-child-pipelines
+  public: true
+  plan:
+  - get: src
+    resource: main-src
+    trigger: true
+    passed: [update-pipeline]
+
+
+    # double check artifactory usage
