@@ -5,3 +5,16 @@ src:
   repoowner: ScunkWorks
   reponame: java-mvn-example
   branch: master
+publish:
+  snapshot:
+    repo: maven-mle-sandbox
+    path: mle/mvnlib/snapshot
+    file_pattern: kafka-streams-example*
+    files_path: src/target
+    files_glob: "*.jar"
+  release:
+    repo: maven-mle-sandbox
+    path: mle/mvnlib/release
+    file_pattern: kafka-streams-example*
+    files_path: src/target
+    files_glob: "*.jar"

@@ -1,7 +1,6 @@
-# example docker build config file
 ---
-# display:
-#   background_image: https://www.smarsh.com//media/smarsh-logo-new.svg
+display:
+  background_image: https://www.smarsh.com//media/smarsh-logo-new.svg
 
 resource_types:
 - name: git
@@ -45,11 +44,10 @@ resources:
     username: ((github.token))
     password: ((github.token))
     fetch_tags: true
-    branch: master # TODO src.branch
+    branch: ((src.branch))
 - name: pr-src
   type: github-pull-request
   icon: github
-  # check_every: 30s # in smarsh github gate closed by default to ensure PRs cannot be merged right away
   source:
     repository: ((src.repo))
     access_token: ((github.token))
@@ -66,20 +64,20 @@ resources:
     version_strategy: multi-file
     url: ((artifactory.hosturl))
     api_key: ((artifactory.token))
-    repository: maven-mle-sandbox # TODO configure
-    path: mle/mvnlib/snapshot # TODO configure
-    file_pattern: 'kafka-streams-example*' # TODO configure
-    version_pattern: '[0-9]+' # TODO configure
+    repository: ((publish.snapshot.repo))
+    path: ((publish.snapshot.path))
+    file_pattern: ((publish.snapshot.file_pattern))
+    version_pattern: '[0-9]+'
 - name: publish-release
   type: artifactory
   source:
     version_strategy: multi-file
     url: ((artifactory.hosturl))
     api_key: ((artifactory.token))
-    repository: maven-mle-sandbox # TODO configure
-    path: mle/mvnlib/release # TODO configure
-    file_pattern: 'kafka-streams-example*' # TODO configure
-    version_pattern: '[0-9]+[.][0-9]+[.][0-9]+' # TODO configure
+    repository: ((publish.release.repo))
+    path: ((publish.release.path))
+    file_pattern: ((publish.release.file_pattern))
+    version_pattern: '[0-9]+[.][0-9]+[.][0-9]+'
 
 jobs:
 - name: pr-build
@@ -123,7 +121,7 @@ jobs:
             path: sh
             user: root
             args:
-            - -exc
+            - -ec
             - |
               export PR_GIT_BRANCH=$(cat src/.git/resource/head_name)
               generatesecrets.sh $PWD/src $PWD/secrets
@@ -151,57 +149,19 @@ jobs:
           args:
           - -ce
           - |
-            #!/usr/bin/env bash
-
-            set -e
-
-            exec 3>&1 # make stdout available as fd 3 for the result
-            exec 1>&2 # redirect all output to stderr for logging
-
-            printf 'out...'
-            echo $1
-            #  INPUT **************************************************************************************
-            # Read stdin (which is json paramter) to file
-            # -M = Monochrome output
-            # -S = Sort order,
-            # . =  get everything.
-            jq -M -S . < /dev/stdin | tee /tmp/input.json    # tee redirects to a file.
-
-            echo "json stdin is:"
-            cat /tmp/input.json
-            echo ""
-
-            # PARSE THE JSON FILE /tmp/input.json
-            TOOL=$(jq -r .params.tool < /tmp/input.json)
-            ACTION=$(jq -r .params.action < /tmp/input.json)
-            BASENAME=$(jq -r .params.basename < /tmp/input.json)
-
-            echo "TOOL=$TOOL; ACTION=$ACTION; BASENAME=$BASENAME;"
-
-            echo ""
-            ls
-            echo ""
-            # TODO move all secrets into the correct location
-            # cp secrets/opt/app-root/.m2/settings.xml /opt/app-root/.m2/
-            # source secrets/etc/app-root/shell-envs.sh
-
-            # TODO: possibly split by if java, else python...
-            cd src
-            ls -a .
+            cp secrets/opt/app-root/.m2/settings.xml /opt/app-root/.m2/
+            source secrets/etc/app-root/shell-envs.sh
             source $MAVEN_HOME/bin/mvn_cmds.sh
-            source $CI_TOOLS/package
-            TAG=$(tags_snapshot ${TOOL})
-            # bash -c "set -e && $(${TOOL}_${ACTION}_COMMAND)"
-            bash $CI_TOOLS/package $ACTION $TOOL $BASENAME
-            ls
-
-            printf "{\"version\":{\"ref\": \"${TAG}\"}}" >&3
-
+            TAG=$(cat tags/java11_tags)
+            pushd src
+            bash -c "set -e && $(java_build_COMMAND)"
+            ls target
+            popd
   - in_parallel: &publishsteps
       - put: publish-snapshot
         params:
-          files: src/target
-          glob: "*.jar"
+          files: ((publish.snapshot.files_path))
+          glob: ((publish.snapshot.files_glob))
   on_success:
     put: pr-src
     params:
@@ -221,6 +181,7 @@ jobs:
     resource: main-src
     trigger: true
     version: every
+    passed: [update-pipeline]
     params:
       fetch_tags: true
   - in_parallel:
@@ -233,7 +194,6 @@ jobs:
             source:
               repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/buildtools
               tag: 0.11.0-test-pr-57ea7b7
-              # tag: latest
               username: ((artifactory.username))
               password: ((artifactory.token))
           params:
@@ -285,14 +245,15 @@ jobs:
             source secrets/etc/app-root/shell-envs.sh
             source $MAVEN_HOME/bin/mvn_cmds.sh
             TAG=$(cat tags/java11_tags)
-            cd src && bash -c "set -e && $(java_build_COMMAND)"
+            pushd src
+            bash -c "set -e && $(java_build_COMMAND)"
             ls target
+            popd
   - in_parallel: &publishsteps
       - put: publish-snapshot
         params:
-          files: src/target
-          glob: "*.jar"
-
+          files: ((publish.snapshot.files_path))
+          glob: ((publish.snapshot.files_glob))
 
 - name: release-build
   plan:
@@ -312,7 +273,6 @@ jobs:
             source:
               repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/buildtools
               tag: 0.11.0-test-pr-57ea7b7
-              # tag: latest
               username: ((artifactory.username))
               password: ((artifactory.token))
           params:
@@ -332,7 +292,7 @@ jobs:
             path: sh
             user: root
             args:
-            - -exc
+            - -ec
             - |
               ls
               # generatesecrets.sh $PWD/src $PWD/secrets
@@ -368,13 +328,15 @@ jobs:
           - |
             source $MAVEN_HOME/bin/mvn_cmds.sh
             TAG=$(cat tags/release_tag)
-            cd src && bash -c "set -e && $(java_build_COMMAND)"
+            pushd src
+            bash -c "set -e && $(java_build_COMMAND)"
             ls target
+            popd
   - in_parallel: &publishsteps
       - put: publish-release
         params:
-          files: src/target
-          glob: "*.jar"
+          files: ((publish.release.files_path))
+          glob: ((publish.release.files_glob))
 
 - name: update-pipeline
   public: true
@@ -389,6 +351,7 @@ jobs:
         type: registry-image
         source:
           repository: docker-dr-dev-virtual.artifacts.corp.digitalreasoning.com/k8s-dev-tools/doozer
+          # tag: latest
           username: ((artifactory.username))
           password: ((artifactory.token))
       inputs:
@@ -413,6 +376,3 @@ jobs:
     resource: main-src
     trigger: true
     passed: [update-pipeline]
-
-
-    # double check artifactory usage
