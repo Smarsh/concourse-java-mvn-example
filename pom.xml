@@ -56,7 +56,7 @@
     <dependency>
         <groupId>org.apache.kafka</groupId>
         <artifactId>kafka-clients</artifactId>
-        <version>2.2.0</version>
+        <version>2.8.1</version>
     </dependency>
     <!-- Dependencies below are required/recommended only when using Apache Avro. -->
     <dependency>
